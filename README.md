@@ -10,11 +10,14 @@ The prompt is based on a real migration of production reports in an Arabic (RTL)
 - **Expression translation.** Stimulsoft (C#-like) expressions are translated into the DevExpress Criteria Language, ideally through a real parser/AST.
 - **Band mapping.** Groups, column headers, master-detail via relations, and independent detail bands.
 - **Data from stored procedures directly.** `SqlDataSource` with `StoredProcQuery`, and no per-report C# code.
-- **20 hard-won rules.** These are silent DevExpress pitfalls that produce empty reports, missing columns or wrong numbers with **no error**.
+- **27 hard-won rules.** These are silent DevExpress pitfalls that produce empty reports, missing columns or wrong numbers with **no error**.
 - **A strict end-to-end verifier:**
   - an SQL Extended Events trace of the real call;
   - a full export from the viewer;
   - bipartite row matching against the stored-procedure result;
+  - both languages and the screens' real filters, with leaked-row and total checks;
+  - negative controls that prove the checker catches deliberate corruptions;
+  - Designer "Save As" copies compared to the original cell for cell;
   - an optional visual diff.
 - **Speed and safety:**
   - parallel and incremental conversion;
@@ -39,6 +42,13 @@ The prompt is based on a real migration of production reports in an Arabic (RTL)
 | A cell is empty | An untranslated Stimulsoft function (for example `Arabic(x)`) |
 | Group order is wrong | `GroupHeaderBand.Level` was set before `Bands.Add` |
 | Arabic separators appear as `?` in CSV | The viewer exports CSV as Windows-1256 by default |
+| A total row is empty | `Sum(DataBand3, Source.Field)` was kept as is; DevExpress needs `Sum([Field])` |
+| From/To dates are empty | `Convert.ToDateTime(x).ToString("fmt")` was not translated |
+| Every customer prints the same address | Company footer fields were frozen at conversion time instead of staying live |
+| English report shows `135٫7` | The request culture was Arabic; the report needs its own formatting culture |
+| An ObjectDataSource report suddenly prints no rows | A batch tool re-saved the layout without the assembly that defines its data type |
+| A "Save As" copy shows the wrong level/company | Server logic was keyed by the report's name, so the copy (new name) skipped it |
+| A checker passes a wrong total | It only checked that the number appears somewhere; negative controls catch this |
 
 ## Contributing
 

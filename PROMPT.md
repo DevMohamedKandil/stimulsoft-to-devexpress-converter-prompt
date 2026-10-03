@@ -19,7 +19,9 @@ Build **"ReportConverter"**: a tool that takes a Stimulsoft `.mrt` and produces 
    - `{MainDs.Field}` → `[Field]`; template variables → `?param`.
    - `ToString(dateParam)` → `FormatString('{0:yyyy-MM-dd}', ?p)`; `X.ToString("fmt")` → `FormatString('{0:fmt}', X)`.
    - `Today` → `Today()`; arithmetic and `Sum()` kept as is.
-   - `Arabic(x)` (Stimulsoft: print x with Arabic-Indic digits) → nested `Replace(ToStr(x), '0', '٠') ... '9' → '٩'`. If it is not translated, the cell renders EMPTY with no error.
+   - `Arabic(x)` (Stimulsoft: print x with Arabic-Indic digits) must always be translated, or the cell renders EMPTY with no error. Follow the business rule: either nested `Replace(ToStr(x), '0', '٠') ... '9' → '٩'`, or (common in practice) keep Western digits in both languages and emit `ToStr(x)`.
+   - `Convert.ToDateTime(x).ToString("fmt")` → `FormatString('{0:fmt}', x)`. Left as is, the cell renders EMPTY.
+   - `Sum(DataBand3, Source.Field)` (Stimulsoft names the band it aggregates over) → `Sum([Field])`. Keeping the first argument turns it into an unknown `?DataBand3` parameter and the total prints EMPTY.
    - Mixed literal and expression text → `Concat(...)`.
    - `{PageNumber}/{TotalPageCount}` → XRPageInfo (NumberOfTotal).
 4. Map bands:
@@ -54,13 +56,24 @@ Build **"ReportConverter"**: a tool that takes a Stimulsoft `.mrt` and produces 
 11. Stimulsoft "Left" alignment inside an RTL text box renders as right.
 12. Arabic literals inside SQL migration scripts: use `NCHAR(code)+...` concatenation, never `N'...'`, because they get corrupted when run.
 13. DevExpress swallows data errors (a report just renders empty). Register `DevExpress.XtraReports.Web.ClientControls.LoggerService` and send errors to the app's ILogger.
-14. The DevExpress viewer's CSV export defaults to Windows-1256, so Arabic separators U+066B/U+066C become '?'. Force UTF-8 export.
+14. The DevExpress viewer's CSV/text export defaults to the server's ANSI code page (Windows-1256), so Arabic separators U+066B/U+066C and RTL marks become '?'. Force UTF-8 with a BOM, which also opens correctly in Excel.
 15. Multi-row bands (a summary row above a detail row) must share the same atomic column-width units, so vertical borders line up exactly.
 16. Cross-query lookups (`GetValue('Query.Field')`, `Sum([Field],'OtherQuery')`) render blank silently. Compute them server-side and inject them as a report Parameter instead.
 17. Stimulsoft functions with no DevExpress equivalent must never be dropped silently. Each one becomes a named, logged "unsupported construct" with its band, component name and original text.
 18. "Query X failed to execute" is often a **command timeout or server memory pressure**, not a conversion bug. Some SPs take 80+ seconds; the default ~30 s timeout kills them. Always read the inner exception. Make CommandTimeout configurable per report, and classify failures as `Timeout`, `SchemaMismatch`, `SqlError` or `ConversionBug` before reporting them.
 19. Row order inside a group can differ: DevExpress re-sorts, while Stimulsoft keeps the SP order. When the template has no explicit sort, preserve the SP order (no SortFields).
 20. Stimulsoft can have known bugs (for example a filter parameter that is never passed). Reproduce Stimulsoft behavior exactly by default and list each such case in the report. Never "fix" business behavior silently.
+21. A `StiDateFormatService` with no pattern means Stimulsoft's **short date** (`{0:d}`), not the full date-time.
+22. Company data in templates (name, tax number, address, phone, email, logo) must stay **live**: emit report parameters filled at render time from the company-info source, never literals read at conversion time. Otherwise every customer prints the development company's address.
+23. Language:
+    - Keyword SPs may disagree on the English code (`en` vs `en-us`). Read both and emit `Iif(StartsWith(Lower(?lang), 'en'), 'English', 'Arabic')`, so any English code works.
+    - Arabic text typed directly into a template has no keyword behind it. Translate it through a small, explicit map, and report anything left untranslated.
+    - A field printed only in Arabic (`NameAr`) switches to `NameEn` (falling back to Arabic when empty) only when the source has it, the template doesn't already print it, and no caption explicitly names the Arabic one (for example "Name (Arabic)").
+    - Fix missing or misspelled keyword texts **in the layout**, so they stay editable in the Designer, instead of silently changing shared SPs.
+24. Formatting culture: requests that default to an Arabic culture format numbers with `٫` and `٬` and put hidden RTL marks in dates. Render DevExpress reports with an explicit report culture (invariant number format, date patterns without marks) on the report routes only, without changing the UI culture.
+25. Any batch tool that loads and re-saves layouts (for example a header rewriter) must load the assembly that defines the report's ObjectDataSource types. Otherwise DevExpress silently saves `<ObjectDataSource Name="x" />` with no type, method or parameters, and the report prints no rows with no error. After every batch, scan all stored layouts for an ObjectDataSource without a DataMember.
+26. Designer "Save As" copies have a new name. Any server-side logic keyed by the report's name (query-key mapping such as `levelId` → `level`, server-computed parameters) silently skips the copy. Store the origin report inside the copy's layout (kept through copies of copies) and key that logic on the origin or on the parameters the layout declares.
+27. Don't add an extra load/save cycle to every served layout just to set an option (for example the export encoding). Set it where the layout is already re-saved.
 
 ## A. Intelligence: make the tool think, not just translate
 1. **Pre-flight analysis** before converting. Parse the template into an intermediate model (IR: pages → bands → components → expressions) and produce a **complexity score** plus a list of features used: groups, relations, sub-reports, charts, conditions, cross-band totals, custom functions. Each report is then classified as `Auto` (convert and verify unattended), `Assisted` (convert, but flag specific spots for a human) or `Manual` (explain why).
@@ -113,6 +126,15 @@ Build **"ReportConverter"**: a tool that takes a Stimulsoft `.mrt` and produces 
 4. Check that **every SP row** appears in the export, using a key column plus a numeric column. Use **maximum bipartite matching per key**, not greedy matching, and numeric tolerance 0.006. Normalize Arabic digits, RTL marks, trailing minus signs and lost separators.
 5. Verify every data band, not only the main one, including independent and related DetailReportBands.
 6. Pass only with 0 missing rows, no fault, real data (rows > 0), a visual-diff score above the threshold, and the build time within a threshold.
+7. Run every report in **both languages** and with the **filters the screens really send**, using the screens' own query-key names and casing (for example `collectorId` vs `CollectorId`, `lang=en-us`).
+8. Filtered cases: run the SP again without the filter. Any value that exists only in the unfiltered result must not appear in the export (no leaked rows).
+9. Totals: every `Sum([F])` must print the SP total, and it must appear once more than the detail rows that already print the same number. A bare "the number exists somewhere" check lets a wrong total pass.
+10. Count fields printed in a group header once per group, not once per row. Restrict a related detail query's rows to the master rows before matching.
+11. Learn the layout's display rules before comparing: zero rows hidden by a `Visible` expression, sign conventions (for example revenue shown sign-flipped), and absolute values on subtotal lines.
+12. Header and footer: company name in the requested language, tax number, live address, "printed by", no page numbers, Western digits only, UTF-8 export.
+13. **Negative controls:** deliberately corrupt a passing export (drop a row, change a total, an Arabic decimal separator, a label in the wrong language, a leaked row, a wrong company name, a page number) and require the checker to FAIL each one. A checker that misses a corruption is a bug in the checker.
+14. Reports with no data in the test period: seed clearly marked test rows, verify, then delete them and confirm that nothing is left.
+15. Designer "Save As": copy each report, render the copy with the same screen parameters, and require it to match the original cell for cell.
 
 ## Required deliverables
 1. **Architecture**: solution layout (Core / Expressions / Rules / Verifier / Cli / optional Admin UI), main classes and interfaces, and the IR model.
